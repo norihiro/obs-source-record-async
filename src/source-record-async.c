@@ -127,6 +127,28 @@ void cb_stopped(void *data, calldata_t *cd)
 	pthread_cond_signal(&s->cond);
 }
 
+static bool is_x264_extenstion(const char *ext)
+{
+	if (strcmp(ext, "mp4") == 0)
+		return true;
+	if (strcmp(ext, "mkv") == 0)
+		return true;
+	return false;
+}
+
+static bool is_rgb_format(enum video_format format)
+{
+	switch (format) {
+	case VIDEO_FORMAT_RGBA:
+	case VIDEO_FORMAT_BGRA:
+	case VIDEO_FORMAT_BGRX:
+	case VIDEO_FORMAT_BGR3:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool thread_start_loop(struct async_record *s)
 {
 	pthread_mutex_lock(&s->mutex);
@@ -166,6 +188,10 @@ static bool thread_start_loop(struct async_record *s)
 		obs_data_set_int(data, "video_bitrate", 2500);
 		obs_data_set_int(data, "audio_bitrate", 320);
 
+		// TODO: let users to choose
+		if (is_x264_extenstion(s->extension) && is_rgb_format(video_output_get_format(s->video_output)))
+			obs_data_set_string(data, "video_encoder", "libx264rgb");
+
 		blog(LOG_INFO, "%p: starting filename=%s", s, filename);
 		bfree(filename);
 
@@ -196,6 +222,25 @@ static bool thread_start_loop(struct async_record *s)
 		s->output = output;
 		return true;
 	}
+}
+
+static void copy_frame_to_output(struct video_frame *dst, const struct obs_source_frame *src)
+{
+	struct obs_source_frame tmp = {
+		.width = src->width,
+		.height = src->height,
+		.format = src->format,
+	};
+	for (int i = 0; i < MAX_AV_PLANES; i++)
+		tmp.data[i] = dst->data[i];
+	for (int i = 0; i < MAX_AV_PLANES; i++)
+		tmp.linesize[i] = dst->linesize[i];
+
+	// Use `obs_source_frame_copy` instead of `video_frame_copy` since it
+	// does not care the difference of `linesize`.
+
+	obs_source_frame_copy(&tmp, src);
+	return;
 }
 
 static void send_video(struct async_record *s, struct obs_source_frame *frame)
@@ -245,26 +290,8 @@ static void send_video(struct async_record *s, struct obs_source_frame *frame)
 		return;
 	}
 
-	// TODO: implement #planes
-	for (int i = 0; i < 1; i++) {
-		if (frame->linesize[i] == output_frame.linesize[i]) {
-			memcpy(output_frame.data[i], frame->data[i], output_frame.linesize[i] * frame->height);
-		}
-		else {
-			uint8_t *d = output_frame.data[i];
-			const uint8_t *s = frame->data[i];
-			uint32_t ls = frame->linesize[i];
-			if (output_frame.linesize[i] < ls)
-				ls = output_frame.linesize[i];
-			for (uint32_t y = 0; y < frame->height; y++) {
-				memcpy(d, s, ls);
-				d += output_frame.linesize[i];
-				s += frame->linesize[i];
-			}
-		}
-	}
+	copy_frame_to_output(&output_frame, frame);
 
-end:
 	video_output_unlock_frame(s->video_output);
 }
 
