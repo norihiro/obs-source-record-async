@@ -21,6 +21,7 @@ struct async_record
 	char *filename_format;
 	char *extension;
 	obs_data_t *output_data;
+	bool overwrite_timestamp;
 
 	// internal data
 	obs_source_t *self;
@@ -30,6 +31,8 @@ struct async_record
 	obs_output_t *output;
 	video_t *video_output;
 	audio_t *audio_output;
+	uint64_t last_video_ns;
+	uint64_t video_frame_interval;
 	// TODO: add audio data
 	async_record_state state;
 	bool enabled;
@@ -103,7 +106,13 @@ static bool create_video_output(struct async_record *s)
 	vi.colorspace = VIDEO_CS_DEFAULT; // TODO: Can I get colorspace from the source?
 	vi.range = frame->full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
 	vi.name = obs_source_get_name(s->self);
-	return video_output_open(&s->video_output, &vi) == VIDEO_OUTPUT_SUCCESS;
+	if (video_output_open(&s->video_output, &vi) != VIDEO_OUTPUT_SUCCESS)
+		return false;
+
+	s->last_video_ns = 0;
+	s->video_frame_interval = video_output_get_frame_time(s->video_output);
+
+	return true;
 }
 
 void cb_stopped(void *data, calldata_t *cd)
@@ -208,9 +217,30 @@ static void send_video(struct async_record *s, struct obs_source_frame *frame)
 		     (int)info->format);
 	}
 
+	int count;
+	uint64_t ts = frame->timestamp;
+	if (!s->last_video_ns) {
+		count = 1;
+		s->last_video_ns = ts;
+	}
+	else {
+		count = (int)((ts - s->last_video_ns) / s->video_frame_interval);
+
+		s->last_video_ns += count * s->video_frame_interval;
+		ts = s->last_video_ns;
+
+		if (count <= 0) {
+			blog(LOG_WARNING, "%p: too many frames received at timestamp=%.3f", s, frame->timestamp * 1e-9);
+			return;
+		}
+	}
+
 	struct video_frame output_frame;
-	// TODO: implement count
-	if (!video_output_lock_frame(s->video_output, &output_frame, 1, frame->timestamp)) {
+	if (count != 1) {
+		blog(LOG_INFO, "%p count=%d frame.timestamp=%.3f ts=%.3f", s, count, frame->timestamp * 1e-9,
+		     ts * 1e-9);
+	}
+	if (!video_output_lock_frame(s->video_output, &output_frame, count, ts)) {
 		blog(LOG_ERROR, "%p: video_output_lock_frame failed timestamp=%.3f", s, frame->timestamp * 1e-9);
 		return;
 	}
@@ -252,7 +282,7 @@ static void thread_main_loop(struct async_record *s)
 			continue;
 		}
 
-		// TODO: take the frame
+		// TODO: move send_video to the video thread (async_record_video)
 		struct obs_source_frame *frame;
 		circlebuf_pop_front(&s->video_frames, &frame, sizeof(frame));
 
@@ -342,6 +372,9 @@ static obs_properties_t *async_record_get_properties(void *unused)
 	prop = obs_properties_add_text(props, "filename_format", obs_module_text("Filename format"), OBS_TEXT_DEFAULT);
 	prop = obs_properties_add_text(props, "extension", obs_module_text("Extension"), OBS_TEXT_DEFAULT);
 
+	obs_properties_add_bool(props, "overwrite_timestamp",
+				obs_module_text("Overwrite video timestamp with OS time"));
+
 	return props;
 }
 
@@ -391,6 +424,8 @@ static void async_record_update(void *data, obs_data_t *settings)
 	changed |= get_string(&s->filename_format, settings, "filename_format");
 	changed |= get_string(&s->extension, settings, "extension");
 
+	s->overwrite_timestamp = obs_data_get_bool(settings, "overwrite_timestamp");
+
 	if (changed) {
 		s->failed = false;
 		s->need_restart = true;
@@ -432,6 +467,8 @@ static void async_record_tick(void *data, float sec)
 	if (s->enabled != s->record) {
 		pthread_mutex_lock(&s->mutex);
 		s->record = s->enabled;
+		if (s->enabled)
+			free_video_data(s);
 		pthread_cond_signal(&s->cond);
 		pthread_mutex_unlock(&s->mutex);
 	}
@@ -445,6 +482,10 @@ static struct obs_source_frame *async_record_video(void *data, struct obs_source
 		struct obs_source_frame *copied_frame =
 			obs_source_frame_create(frame->format, frame->width, frame->height);
 		obs_source_frame_copy(copied_frame, frame);
+
+		// Not sure this is really required.
+		if (s->overwrite_timestamp || !copied_frame->timestamp)
+			copied_frame->timestamp = obs_get_video_frame_time();
 
 		pthread_mutex_lock(&s->mutex);
 		circlebuf_push_back(&s->video_frames, &copied_frame, sizeof(copied_frame));
