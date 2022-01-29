@@ -276,14 +276,17 @@ static void thread_close_loop(struct async_record *s)
 	// obs_output_stop(s->output);
 	// TODO: gracely stop and wait
 
-	if (s->video_output)
-		video_output_close(s->video_output);
-
 	if (!s->output_stopped) {
 		obs_output_force_stop(s->output);
 	}
 
 	obs_output_release(s->output);
+
+	if (s->video_output) {
+		video_output_close(s->video_output);
+		s->video_output = NULL;
+	}
+
 	s->output = NULL;
 }
 
@@ -321,10 +324,8 @@ static void free_video_data(struct async_record *s)
 
 		circlebuf_pop_front(&s->video_frames, &frame, sizeof(frame));
 
-		if (os_atomic_dec_long(&frame->refs) <= 0) {
+		if (os_atomic_dec_long(&frame->refs) <= 0)
 			obs_source_frame_destroy(frame);
-			frame = NULL;
-		}
 	}
 }
 
@@ -440,7 +441,7 @@ static struct obs_source_frame *async_record_video(void *data, struct obs_source
 {
 	struct async_record *s = data;
 
-	if (frame->width > 0 && frame->height > 0) {
+	if (s->record && frame->width > 0 && frame->height > 0) {
 		struct obs_source_frame *copied_frame =
 			obs_source_frame_create(frame->format, frame->width, frame->height);
 		obs_source_frame_copy(copied_frame, frame);
