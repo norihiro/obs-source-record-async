@@ -1,4 +1,4 @@
-# OBS Asynchronous Source Record
+# Asynchronous Source Record plugin for OBS Studio
 
 ## Introduction
 
